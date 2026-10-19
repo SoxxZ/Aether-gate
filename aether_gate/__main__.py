@@ -32,7 +32,9 @@ def build_adapter(name, args):
         return cls(driver=args.soapy_driver, device_args=args.soapy_args,
                    samp_rate=args.samp_rate, gain_db=args.gain,
                    model=args.model, serial=args.serial, station=args.station,
-                   direct_samp=args.direct_samp, agc=args.agc)
+                   direct_samp=args.direct_samp, agc=args.agc,
+                   lock_hz=args.soapy_lock_hz,
+                   iq_invert=args.soapy_iq_invert, iq_correct=args.soapy_iq_correct)
     if name == "icom9700":
         # give the 9700 a distinct identity unless the user overrode the shared defaults
         serial = args.serial if args.serial != "GATE0001" else "GATE9700"
@@ -66,6 +68,12 @@ def build_adapter(name, args):
                    soapy_driver=args.soapy_driver, soapy_args=args.soapy_args,
                    samp_rate=args.samp_rate, gain_db=args.gain,
                    direct_samp=args.direct_samp, agc=args.agc,
+                   soapy_lock_hz=args.soapy_lock_hz,
+                   soapy_iq_invert=args.soapy_iq_invert,
+                   soapy_iq_correct=args.soapy_iq_correct,
+                   audio_source=args.audio_source,
+                   radio_audio_in=args.radio_audio_in,
+                   radio_audio_out=args.radio_audio_out,
                    advertise=(args.model if args.model != "FLEX-6600" else None),
                    serial=serial, station=station, enable_tx=args.enable_tx)
     if name == "yaesu":
@@ -84,6 +92,12 @@ def build_adapter(name, args):
                    soapy_driver=args.soapy_driver, soapy_args=args.soapy_args,
                    samp_rate=args.samp_rate, gain_db=args.gain,
                    direct_samp=args.direct_samp, agc=args.agc,
+                   soapy_lock_hz=args.soapy_lock_hz,
+                   soapy_iq_invert=args.soapy_iq_invert,
+                   soapy_iq_correct=args.soapy_iq_correct,
+                   audio_source=args.audio_source,
+                   radio_audio_in=args.radio_audio_in,
+                   radio_audio_out=args.radio_audio_out,
                    advertise=(args.model if args.model != "FLEX-6600" else None),
                    serial=serial, station=station, enable_tx=args.enable_tx)
     return cls()
@@ -125,6 +139,21 @@ def main(argv=None):
     ap.add_argument("--gain", type=float, default=40.0, help="soapy adapter: RX gain dB (ignored if --agc)")
     ap.add_argument("--agc", action="store_true", help="soapy adapter: enable hardware AGC")
     ap.add_argument("--direct-samp", default=None, help="soapy adapter: RTL direct-sampling mode (Q=2 for HF on non-V4)")
+    ap.add_argument("--soapy-lock-hz", type=float, default=None,
+                    help="IF-tap mode: lock the Soapy tuner at this centre (Hz) and never "
+                         "retune it (e.g. 47055000 for a 47.055 MHz IF tap); only the rig VFO moves")
+    ap.add_argument("--soapy-iq-invert", action="store_true",
+                    help="soapy adapter: invert I/Q (driver 'iq_swap' setting — mirrors the spectrum)")
+    ap.add_argument("--soapy-iq-correct", action="store_true",
+                    help="soapy adapter: enable Soapy automatic I/Q correction (setIQBalanceMode/setDCOffsetMode)")
+    # audio source (kenwood/yaesu: the dongle demod vs the rig's own audio card)
+    ap.add_argument("--audio-source", default="sdr", choices=("sdr", "radio"),
+                    help="RX audio source for CAT rigs: 'sdr' = demodulate the dongle IQ (default); "
+                         "'radio' = the rig's own audio captured from a USB audio card (e.g. PICO-Diginterface)")
+    ap.add_argument("--radio-audio-in", default=None,
+                    help="ALSA capture device feeding AE (default: auto-find the Pico Diginterface card)")
+    ap.add_argument("--radio-audio-out", default=None,
+                    help="ALSA playback device feeding the rig's DATA input for TX audio (default: auto-find Pico)")
     # Icom adapter options
     ap.add_argument("--radio-ip", default=None, help="icom9700 adapter: IC-9700 LAN IP")
     ap.add_argument("--user", default=None, help="icom9700 adapter: radio Network username")

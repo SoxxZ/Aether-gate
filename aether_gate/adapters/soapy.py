@@ -34,16 +34,29 @@ class SoapyAdapter(RadioAdapter):
 
     def __init__(self, driver="rtlsdr", device_args="", samp_rate=2_040_000,
                  gain_db=40.0, center_hz=14_100_000.0, model="FLEX-6700",
-                 serial="GATE0001", station="aether-gate 1", direct_samp=None, agc=False):
+                 serial="GATE0001", station="aether-gate 1", direct_samp=None, agc=False,
+                 lock_hz=None, iq_invert=False, iq_correct=False):
         # NB default 2.040 MS/s (not 2.048) = EXACTLY 85 * 24 kHz, so audio decimation
         # is integer with no drift/underrun. RTL accepts it; panadapter span is fine.
         self.driver = driver
         self.device_args = device_args
         self.samp_rate = float(samp_rate)
         self.gain_db = float(gain_db)
+        # -- IF-tap lock: when lock_hz is given the hardware tunes there ONCE and
+        # never again — every retune path below is suppressed. AE's axis stays in
+        # RF terms (follows the rig VFO); the IQ block is always the fixed-IF
+        # spectrum, which is what a radio's IF tap actually delivers.
+        self.lock_hz = float(lock_hz) if lock_hz else None
+        if self.lock_hz is not None:
+            center_hz = self.lock_hz
         self.center_hz = float(center_hz)
         self.direct_samp = direct_samp      # RTL direct-sampling mode (Q=2 for HF on non-V4); None=auto
         self.agc = agc
+        # I/Q invert mirrors the spectrum (RTL driver's "iq_swap" device setting);
+        # iq_correct enables the standard Soapy auto-correction API
+        # (setDCOffsetMode/setIQBalanceMode) — same calls SDR++ makes.
+        self.iq_invert = bool(iq_invert)
+        self.iq_correct = bool(iq_correct)
         self.capabilities = AdapterCaps(model=model, serial=serial, station=station, tx_capable=False,
                                         min_span_hz=48_000.0, max_span_hz=samp_rate)
         self._sdr = None
@@ -81,9 +94,18 @@ class SoapyAdapter(RadioAdapter):
             for kv in self.device_args.split(","):
                 if "=" in kv:
                     k, v = kv.split("=", 1); args[k] = v
-        self._sdr = SoapySDR.Device(args)
+        # Ubuntu's SWIG bindings cannot build a device from a plain dict
+        # ("SoapySDR::Device::make() no match"); enumerate first, then open
+        # the matched result.
+        found = SoapySDR.Device.enumerate(args)
+        if not found:
+            raise RuntimeError("SoapySDR: no device matches %r" % (args,))
+        self._sdr = SoapySDR.Device(found[0])
         self._sdr.setSampleRate(SOAPY_SDR_RX, 0, self.samp_rate)
         self._sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_hz)
+        if self.lock_hz is not None:
+            print(f"[soapy] frequency LOCKED at {self.center_hz / 1e6:.6f} MHz "
+                  "(IF tap — hardware will not retune)", flush=True)
         try:
             self._sdr.setGainMode(SOAPY_SDR_RX, 0, bool(self.agc))   # AGC on/off
         except Exception:
@@ -95,6 +117,22 @@ class SoapyAdapter(RadioAdapter):
                 self._sdr.writeSetting("direct_samp", str(self.direct_samp))
             except Exception:
                 pass
+        if self.iq_invert:                                          # mirror the spectrum ("iq_swap")
+            try:
+                self._sdr.writeSetting("iq_swap", True)
+                print("[soapy] I/Q INVERTED (iq_swap on)", flush=True)
+            except Exception as exc:
+                print(f"[soapy] WARN: iq_swap not supported by driver: {exc}", flush=True)
+        if self.iq_correct:                                         # standard Soapy auto IQ correction
+            try:
+                self._sdr.setDCOffsetMode(SOAPY_SDR_RX, 0, True)
+            except Exception:
+                pass
+            try:
+                self._sdr.setIQBalanceMode(SOAPY_SDR_RX, 0, True)
+                print("[soapy] I/Q CORRECTION on (auto DC offset + IQ balance)", flush=True)
+            except Exception as exc:
+                print(f"[soapy] I/Q correction: driver refused ({exc})", flush=True)
 
         self._stream = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
         self._sdr.activateStream(self._stream)
@@ -143,11 +181,12 @@ class SoapyAdapter(RadioAdapter):
         while self._run:
             # apply any pending retune on this thread (avoid racing readStream)
             if self._retune_to is not None:
-                try:
-                    self._sdr.setFrequency(self._SOAPY_SDR_RX, 0, float(self._retune_to))
-                    self.center_hz = float(self._retune_to)
-                except Exception:
-                    pass
+                if self.lock_hz is None:          # IF-tap lock: hardware never retunes
+                    try:
+                        self._sdr.setFrequency(self._SOAPY_SDR_RX, 0, float(self._retune_to))
+                        self.center_hz = float(self._retune_to)
+                    except Exception:
+                        pass
                 self._retune_to = None
             sr = self._sdr.readStream(self._stream, [buf], CHUNK, timeoutUs=200000)
             n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
@@ -176,6 +215,11 @@ class SoapyAdapter(RadioAdapter):
         window; only physically retune the V4 if the slice nears the window edge
         (keeps the hardware centre stable so small tuning doesn't thrash the tuner)."""
         slice_hz = float(slice_hz)
+        if self.lock_hz is not None:
+            # IF-tap lock: the slice for DEMOD purposes sits at the lock frequency
+            # (the rig's IF is always centred there); no edge retune either.
+            self._slice_hz = self.lock_hz
+            return
         self._slice_hz = slice_hz
         # usable window = ~80% of the sample rate (avoid the filtered band edges)
         edge = 0.40 * self.samp_rate
@@ -185,6 +229,8 @@ class SoapyAdapter(RadioAdapter):
 
     def retune(self, center_hz):
         # Legacy/explicit hardware recentre (e.g. a band-change pan set).
+        if self.lock_hz is not None:
+            return                      # IF-tap lock: the tuner never moves
         self._retune_to = float(center_hz)
 
     def set_mode(self, mode):
@@ -192,8 +238,11 @@ class SoapyAdapter(RadioAdapter):
 
     # --- the IQ source (core FFTs this) ---------------------------------
     def get_iq(self, n, center_hz, span_hz):
-        # If AE's centre moved, schedule the hardware to follow.
-        if abs(center_hz - self.center_hz) > 1.0 and self._retune_to is None:
+        # If AE's centre moved, schedule the hardware to follow — unless the
+        # frequency is locked (IF tap): the block is always the fixed-IF spectrum
+        # and AE's RF axis is relabelled by the adapter (rig VFO), not the tuner.
+        if (self.lock_hz is None and abs(center_hz - self.center_hz) > 1.0
+                and self._retune_to is None):
             self._retune_to = float(center_hz)
         with self._lock:
             blk = self._latest

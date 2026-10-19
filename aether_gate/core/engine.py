@@ -218,8 +218,8 @@ def wf_packet(stream_id, seq, intens, low_hz, binbw_hz, timecode, auto_black=20)
     # here; AE's #3586 auto-black path uses it as the waterfall black/low point.
     # Pass the frame's measured floor (min raw) for faithful emulation.
     w = len(intens)
-    low_raw = int(round(low_hz))                           # plain Hz (|val|<1e11 -> AE decodes as Hz;
-    binbw_raw = int(round(binbw_hz))                       # unambiguous for HF/VHF, unlike Hz*2^20 at low f)
+    low_raw = int(round(float(low_hz) * 1048576.0))        # VitaFrequency = Hz x 2^20 (AE #3449/#4412:
+    binbw_raw = int(round(float(binbw_hz) * 1048576.0))    # decode is unconditional; plain Hz mis-reads)
     sub = struct.pack(">qqIHHIIHH", low_raw, binbw_raw, 100, w, 1, timecode, auto_black, w, 0)
     payload = sub + struct.pack(">%dh" % w, *intens)       # signed int16, AE reads /128.0
     return vita_header(stream_id, PCC_WF, seq, len(payload)) + payload
@@ -2520,6 +2520,7 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
 <label style="margin:0"><input type=radio name=asrc value=tone id=r_tone onchange=updAudio()> Tone <span style="color:#888;font-size:12px">(440 Hz sine)</span></label>
 <label style="margin:0"><input type=radio name=asrc value=noise id=r_noise onchange=updAudio()> Noise <span style="color:#888;font-size:12px">(gaussian)</span></label>
 <label style="margin:0"><input type=radio name=asrc value=wav id=r_wav onchange=updAudio()> WAV file</label>
+{adapter_audio}
 </div>
 <div id=wav_row style="margin-top:10px;display:none">
 <label style="margin:0 0 4px;display:block;font-size:13px;color:#aaa">Fixture (from fixtures/)</label>
@@ -2736,9 +2737,38 @@ def _grouped_pattern_options(current):
     return "".join(grouped)
 
 
+def _adapter_audio_fragment(radio):
+    """Panel fragment: the adapter's own audio sources (sdr demod | radio audio
+    via its USB card), as radios in the same 'Audio source' group. Empty when
+    the radio has no adapter sources (sim, Icom LAN, ...)."""
+    a = radio.adapter
+    if a is None or not hasattr(a, "audio_sources"):
+        return ""
+    try:
+        sources = tuple(a.audio_sources())
+    except Exception:
+        return ""
+    cur = getattr(a, "_audio_source", "sdr")
+
+    def rb(val, label, hint):
+        checked = " checked" if val == cur else ""
+        return (f'<label style="margin:0"><input type=radio name=asrc value={val}{checked} '
+                f'onchange=updAudio()> {label} '
+                f'<span style="color:#888;font-size:12px">({hint})</span></label>')
+
+    hints = {"sdr": "dongle IQ demodulated by the gate",
+             "radio": "the rig's own audio via its USB interface"}
+    frag = ('<div style="width:100%;margin:8px 0 2px;color:#666;font-size:12px">'
+            'radio source (adapter):</div>')
+    for s in sources:
+        frag += rb(s, "SDR demod" if s == "sdr" else "Radio", hints.get(s, s))
+    return frag
+
+
 def start_control_server(radio, port):
     opts = _grouped_pattern_options(radio.pattern)
-    page = CONTROL_HTML.format(options=opts, tt_khz=f"{TWO_TONE_SPACING_HZ / 1000.0:g}").encode()
+    page = CONTROL_HTML.format(options=opts, tt_khz=f"{TWO_TONE_SPACING_HZ / 1000.0:g}",
+                               adapter_audio=_adapter_audio_fragment(radio)).encode()
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -2872,6 +2902,13 @@ def start_control_server(radio, port):
                         if src in (AUDIO_SRC_SILENCE, AUDIO_SRC_TONE, AUDIO_SRC_NOISE, AUDIO_SRC_WAV):
                             radio.audio_source = src
                             log(f"[ctl] audio_source -> {src}")
+                        elif (radio.adapter is not None and src in
+                              getattr(radio.adapter, "audio_sources", lambda: ())()):
+                            # adapter-owned source (sdr demod | radio audio card):
+                            # the engine stays on demod; the adapter routes it.
+                            radio.audio_source = AUDIO_SRC_DEMOD
+                            radio.adapter.set_audio_source(src)
+                            log(f"[ctl] audio_source -> {src} (adapter)")
                     if "wav_path" in q:
                         radio.audio_wav_path = q["wav_path"][0] or None
                         log(f"[ctl] audio_wav_path -> {radio.audio_wav_path}")

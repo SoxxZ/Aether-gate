@@ -21,11 +21,13 @@ running). The soapy half is HW-proven (RTL-SDR V4 on the Pi5); the hamlib half
 is new. The CAT-steer cadence is deliberately gentle (poll the rig ~2-3x/s) —
 mirrors the lesson from the IC-9700 (don't flood the rig's CAT).
 """
+import struct
 import threading
 import time
 
 from ..base import RadioAdapter, AdapterCaps, Meters
 from ..soapy import SoapyAdapter
+from ..audio_io import RadioAudioCapture, AlsaPcmPlayback, find_alsa_card
 from ..hamlib.rigctld import Rigctld
 from .radios import get as get_kenwood
 
@@ -45,6 +47,18 @@ class KenwoodAdapter(RadioAdapter):
                  # soapy spectrum dongle (defaults suit an RTL-SDR Blog V4)
                  soapy_driver="rtlsdr", soapy_args="", samp_rate=2_040_000,
                  gain_db=40.0, direct_samp=None, agc=False,
+                 # IF-tap lock: fix the dongle centre (Hz), never retune it — the
+                 # rig's IF is always translated there, so the spectrum block
+                 # stays put while only the rig VFO moves.
+                 soapy_lock_hz=None,
+                 # I/Q invert mirrors the spectrum (RTL 'iq_swap'); iq_correct
+                 # enables the standard Soapy auto-correction API.
+                 soapy_iq_invert=False, soapy_iq_correct=False,
+                 # RX audio source: "sdr" = demodulate the dongle IQ (default);
+                 # "radio" = the rig's own RX audio captured from a USB audio
+                 # interface (e.g. PICO-Diginterface) — every mode, the rig's
+                 # own filters/AGC, and no demod DSP load on this host.
+                 audio_source="sdr", radio_audio_in=None, radio_audio_out=None,
                  # AE identity
                  advertise=None, serial="GATEKENW", station="Kenwood-CAT",
                  # TX intent — OFF by default. There is no PTT path wired in the
@@ -71,12 +85,34 @@ class KenwoodAdapter(RadioAdapter):
         self._rigctld_proc = None
         self._ctl = Rigctld(rigctld_host, rigctld_port)
 
+        # RX audio source: "sdr" (dongle demod, default) | "radio" (the rig's
+        # own audio, captured from the USB audio card — lazily opened).
+        self._audio_source = audio_source if audio_source in ("sdr", "radio") else "sdr"
+        self._radio_audio_in = radio_audio_in
+        self._radio_audio_out = radio_audio_out
+        self._radio_capture = None
+
+        # TX (PTT + TX audio). PTT is applied by the SINGLE hamlib worker (the
+        # 4800-baud serial rule) from a target posted by key_tx/unkey_tx; the
+        # TX-audio drain runs on its own thread while keyed, feeding AE's
+        # dax_tx audio to the rig's DATA input via the USB audio card. NB the
+        # rig only routes its rear DATA input in DATA modes (J2B etc.); on
+        # phone SSB use the rig's own mic — PTT-only from here.
+        self._ptt_target = None              # True/False posted by key/unkey_tx
+        self._ptt_state = False              # last state actually applied
+        self._tx_audio_source = None         # engine.drain_tx_audio (wired by engine)
+        self._tx_thread = None
+        self._tx_stop = None
+        self._tx_play = None
+
         # The dongle does the spectrum; start it centred wherever the rig is (updated on open()).
         self._sdr = SoapyAdapter(driver=soapy_driver, device_args=soapy_args,
                                  samp_rate=samp_rate, gain_db=gain_db,
                                  center_hz=14_100_000.0, model=adv,
                                  serial=serial, station=station,
-                                 direct_samp=direct_samp, agc=agc)
+                                 direct_samp=direct_samp, agc=agc,
+                                 lock_hz=soapy_lock_hz,
+                                 iq_invert=soapy_iq_invert, iq_correct=soapy_iq_correct)
 
         # bands= advertised to AE (radio-declared-bands). tx_capable reflects the
         # opt-in enable_tx flag, NOT a hardcoded "real transceiver" guess: no PTT is
@@ -143,8 +179,9 @@ class KenwoodAdapter(RadioAdapter):
         m = self._ctl.get_mode()
         if f:
             self._freq_hz = f
-            self._sdr.center_hz = float(f)          # centre the dongle on the rig before it opens
-            self._sdr._slice_hz = float(f)
+            if self._sdr.lock_hz is None:      # IF-tap lock: dongle centre is fixed,
+                self._sdr.center_hz = float(f) # never clobber it with the rig's RF
+                self._sdr._slice_hz = float(f)
         if m:
             self._mode = m
         # 2. dongle spectrum up, centred on the rig
@@ -159,7 +196,15 @@ class KenwoodAdapter(RadioAdapter):
 
     def close(self):
         self._poll_run = False
+        try:                                    # never leave the rig keyed
+            self._ctl.set_ptt(False); self._ptt_state = False
+        except Exception: pass
+        self._stop_tx_audio()
         try: self._sdr.close()
+        except Exception: pass
+        try:
+            if self._radio_capture is not None:
+                self._radio_capture.close()
         except Exception: pass
         try: self._ctl.close()
         except Exception: pass
@@ -183,6 +228,10 @@ class KenwoodAdapter(RadioAdapter):
         while self._poll_run:
             time.sleep(0.20)
             try:
+                # 0. AE keyed/unkeyed? PTT first (safety-critical), and the
+                #    single-writer rule means only this thread may touch rigctld.
+                if self._apply_ptt():
+                    continue
                 # 1. AE asked to SET freq? (coalesced: only the latest wins)
                 tgt = self._set_freq_target
                 if tgt is not None:
@@ -233,8 +282,145 @@ class KenwoodAdapter(RadioAdapter):
     def get_iq(self, n, center_hz, span_hz):
         return self._sdr.get_iq(n, center_hz, span_hz)
 
-    def get_audio(self, *a, **k):
-        return self._sdr.get_audio(*a, **k) if hasattr(self._sdr, "get_audio") else None
+    def get_audio(self, n_samples, slice_hz=None, mode=None):
+        """RX audio for AE from the SELECTED source. "radio" reads the rig's own
+        audio off the USB card (slice/mode are the rig's business there — it is
+        already demodulating); a dead capture falls back to the SDR demod so the
+        stream never goes silent."""
+        if self._audio_source == "radio":
+            cap = self._radio_capture_open()
+            a = cap.read(n_samples) if cap else None
+            if a is not None:
+                return a
+        return self._sdr.get_audio(n_samples, slice_hz=slice_hz, mode=mode) \
+            if hasattr(self._sdr, "get_audio") else None
+
+    # --- audio source selection (panel/CLI: sdr | radio) -------------------
+    def audio_sources(self):
+        return ("sdr", "radio")
+
+    def set_audio_source(self, name):
+        if name not in ("sdr", "radio"):
+            raise ValueError(f"unknown audio source {name!r} (sdr|radio)")
+        if name != self._audio_source:
+            self._audio_source = name
+            print(f"[kenwood] audio source -> {name}", flush=True)
+
+    def _radio_capture_open(self):
+        if self._radio_capture is None:
+            dev = self._radio_audio_in or find_alsa_card("pico") or "default"
+            self._radio_capture = RadioAudioCapture(device=dev)
+            print(f"[kenwood] radio-audio capture on {self._radio_capture.detail}", flush=True)
+        return self._radio_capture
+
+    # --- TX: AE's xmit -> hamlib PTT (single worker) + dax_tx -> rig audio --
+    def key_tx(self):
+        """AE keyed (MOX / xmit 1). The worker thread asserts PTT via hamlib."""
+        self._ptt_target = True
+
+    def unkey_tx(self):
+        """AE unkeyed. Worker drops PTT; the drain thread fades out + exits."""
+        self._ptt_target = False
+
+    def _apply_ptt(self):
+        """Worker side: apply a posted PTT target via hamlib (single writer).
+        Returns True if a target was consumed (poll tick should skip other
+        rig work). TX audio follows PTT: start on key, fade out on unkey."""
+        pt = self._ptt_target
+        if pt is None:
+            return False
+        self._ptt_target = None
+        if self._ctl.set_ptt(pt):
+            self._ptt_state = pt
+            if pt:
+                self._start_tx_audio()
+            else:
+                self._stop_tx_audio()
+        return True
+
+    def set_tx_audio_source(self, source):
+        """Engine seam: source(max_bytes) -> AE TX audio, mono int16 LE @ 24 kHz
+        (the dax_tx rate). Called once at wiring."""
+        self._tx_audio_source = source
+
+    def _start_tx_audio(self):
+        if self._tx_audio_source is None or self._tx_thread is not None:
+            return
+        dev = self._radio_audio_out or find_alsa_card("pico") or "default"
+        play = AlsaPcmPlayback(device=dev)
+        if not play.open():
+            print(f"[tx-audio] open failed on {dev}: {play.last_error}", flush=True)
+            return
+        self._tx_play = play
+        self._tx_stop = threading.Event()
+        self._tx_thread = threading.Thread(target=self._tx_loop, args=(self._tx_stop,),
+                                           name="hamlib-tx-audio", daemon=True)
+        self._tx_thread.start()
+        print(f"[tx-audio] drain START -> {dev}", flush=True)
+
+    def _stop_tx_audio(self):
+        ev = self._tx_stop
+        if ev is not None:
+            ev.set()
+        self._tx_thread = None
+        self._tx_stop = None
+
+    def _tx_loop(self, stop):
+        """Drain AE's dax_tx ring -> aplay while keyed. 20 ms ticks with a
+        fade in/out (no key clicks). Latency grace — the lesson from the
+        IC-9700 path: AE keys BEFORE the audio lands over the network, so
+        stay silent-but-running until real audio arrives, then keep flushing
+        until the ring dries (bounded) after unkey."""
+        src, play = self._tx_audio_source, self._tx_play
+        n = 480                                    # 20 ms @ 24 kHz mono
+        fade_chunks = 8                            # ~160 ms fade in/out
+        chunk_i = 0
+        seen = False
+        stopped_at = None
+        try:
+            while True:
+                stopped = stop.is_set()
+                try:
+                    got = src(n * 2) or b""
+                except Exception:
+                    got = b""
+                if got:
+                    seen = True
+                    stopped_at = None             # audio still arriving: no fade-out yet
+                elif stopped:
+                    if not seen:
+                        break                     # never got audio: drop quietly
+                    if stopped_at is None:
+                        stopped_at = time.monotonic()
+                    elif time.monotonic() - stopped_at > 1.0:
+                        break                     # flushed enough: fade done
+                blk = (got + b"\x00" * (n * 2))[:n * 2] if got else b"\x00" * (n * 2)
+                g = 1.0
+                if not seen:
+                    g = 0.0                       # silence until real audio shows
+                elif stopped_at is not None:
+                    g = max(0.0, 1.0 - (time.monotonic() - stopped_at) / 0.16)
+                elif chunk_i < fade_chunks:
+                    g = (chunk_i + 1) / fade_chunks
+                if g < 1.0:
+                    blk = self._scale_pcm(blk, g)
+                if not play.write(blk):
+                    break                         # sink died (unplugged) — stop
+                chunk_i += 1
+                time.sleep(0.005)                 # aplay buffers; natural pacing
+        finally:
+            try:
+                play.close()
+            except Exception:
+                pass
+            self._tx_play = None
+            print("[tx-audio] drain STOP", flush=True)
+
+    @staticmethod
+    def _scale_pcm(blk, g):
+        vals = struct.unpack("<%dh" % (len(blk) // 2), blk)
+        vals = [max(-32768, min(32767, int(v * g))) for v in vals]
+        return struct.pack("<%dh" % len(vals), *vals)
 
     # --- control (AE -> rig): POST a target; the worker does the hamlib I/O.
     # Non-blocking + coalescing — rapid AE tunes just overwrite the target, so
@@ -299,4 +485,9 @@ class KenwoodAdapter(RadioAdapter):
             "meters": {"s_meter_dbm": (round(-73.0 + self._smeter_db, 1)
                                        if self._smeter_db is not None else None)},
             "flags": {"cat_control": self._ctl.connected},
+            "audio": {"source": self._audio_source,
+                      "radio_in": (self._radio_capture.detail
+                                   if self._radio_capture else None),
+                      "tx_audio": bool(self._tx_audio_source)},
+            "ptt": self._ptt_state,
         }
