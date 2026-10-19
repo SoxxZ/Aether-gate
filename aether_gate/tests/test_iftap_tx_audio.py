@@ -120,6 +120,20 @@ def test_audio_source_routing():
     print("ok  audio: sdr/radio routing + fallback + validation")
 
 
+def test_radio_capture_released_on_switch():
+    a = _adapter()
+    cap = _StubCapture()
+    a._radio_capture = cap                     # as if radio mode ran for a while
+    a.set_audio_source("radio")
+    assert a._radio_capture is cap, "existing capture must be kept while radio"
+    a.set_audio_source("sdr")
+    assert cap.closed, "leaving radio must close the arecord (device + child)"
+    assert a._radio_capture is None, "capture must be dropped after close"
+    # an in-flight read after the switch must not resurrect the capture
+    assert a._radio_capture_open() is None, "capture must not reopen while on sdr"
+    print("ok  audio: radio capture closed + not resurrected on switch to sdr")
+
+
 def test_panel_fragment():
     from aether_gate.core.engine import _adapter_audio_fragment
     none_radio = types.SimpleNamespace(adapter=None)
@@ -139,7 +153,8 @@ def test_panel_fragment():
 
 def main():
     for t in (test_wf_vitafrequency_encoding, test_ptt_via_worker,
-              test_audio_source_routing, test_panel_fragment):
+              test_audio_source_routing, test_radio_capture_released_on_switch,
+              test_panel_fragment):
         try:
             t()
         except AssertionError as e:

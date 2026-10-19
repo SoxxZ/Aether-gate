@@ -303,10 +303,21 @@ class KenwoodAdapter(RadioAdapter):
         if name not in ("sdr", "radio"):
             raise ValueError(f"unknown audio source {name!r} (sdr|radio)")
         if name != self._audio_source:
-            self._audio_source = name
+            self._audio_source = name          # flip FIRST: in-flight reads fall back to SDR
+            if name != "radio" and self._radio_capture is not None:
+                # Leaving radio: release the arecord child — otherwise it keeps
+                # capturing forever, holds the ALSA device (blocks other users)
+                # and can linger as an unreaped zombie.
+                cap, self._radio_capture = self._radio_capture, None
+                try:
+                    cap.close()
+                except Exception:
+                    pass
             print(f"[kenwood] audio source -> {name}", flush=True)
 
     def _radio_capture_open(self):
+        if self._audio_source != "radio":
+            return None                        # switched away mid-read: never (re)create
         if self._radio_capture is None:
             dev = self._radio_audio_in or find_alsa_card("pico") or "default"
             self._radio_capture = RadioAudioCapture(device=dev)
