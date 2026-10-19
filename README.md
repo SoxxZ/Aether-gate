@@ -26,6 +26,40 @@ radio chooser with a live panadapter and waterfall.
 
 ---
 
+## This fork (SoxxZ/Aether-gate)
+
+Maintained for a **Yaesu FT-600** used as a data-mode station: RTL-SDR tapped
+off the rig's 47.055 MHz IF, audio through a PICO-Diginterface, CAT via a
+hamlib rigctld fork. Changes vs upstream `main`:
+
+- **Fixed black waterfall on AetherSDR ≥ 26.10.** The waterfall tile's
+  `FrameLowFreq`/`BinBandwidth` are now encoded as VitaFrequency
+  (Hz × 2²⁰), which AE decodes unconditionally (aethersdr/AetherSDR
+  #3449/#4412); the old plain-Hz values mis-read to ~0 Hz and rendered a
+  black waterfall.
+- **Locked-IF tap support.** `--soapy-lock-hz 47055000` holds the dongle on
+  the fixed IF (the rig tunes, the dongle doesn't), plus `--soapy-iq-invert`
+  / `--soapy-iq-correct` (spectrum mirroring, Soapy DC-offset + IQ-balance
+  auto-correction) and more robust RTL-SDR enumeration.
+- **Real TX for Kenwood/Yaesu CAT rigs.** `--enable-tx` now wires PTT for
+  real: AE's `xmit` → hamlib `set_ptt` through the single CAT worker (the
+  4800-baud serial rule), best-effort unkey on shutdown, and AE's TX audio
+  (`dax_tx`) drained to the rig's DATA input over USB audio with fade-in/out
+  and the key-before-audio latency grace. TX audio reaches RF only in data
+  modes (J2B / DATA-N etc.); in phone SSB the rig uses its own mic.
+- **Audio source selection.** AE's RX audio can be the gate's SDR demod
+  (`--audio-source sdr`, default) **or** the rig's own audio captured from a
+  USB audio card such as the PICO-Diginterface (`--audio-source radio`;
+  ALSA card auto-detected, override with `--radio-audio-in` /
+  `--radio-audio-out`). Switchable live in the control panel's **Audio
+  source** section — the rig's audio gives every mode with the rig's own
+  filters/AGC and zero demod DSP load on the gate host.
+
+Run `python -m aether_gate.tests.test_iftap_tx_audio` for the fork's
+regression tests (waterfall encoding, PTT routing, audio-source selection).
+
+---
+
 ## What it does
 
 - **Presents a radio to AetherSDR as a Flex 6000.** AE discovers it on the LAN and
