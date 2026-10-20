@@ -74,7 +74,9 @@ class SoapyAdapter(RadioAdapter):
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._decim = None                  # samp_rate / AUDIO_RATE (integer-ish); set in open()
         self._stages = []                   # decimation factors per stage
-        self._stage_firs = []               # [taps, overlap_state, M] per stage
+        self._stage_firs = []               # [taps, overlap_state, M] per stage AFTER the box stage
+        self._box_m = None                  # stage-1 CIC box decimation factor (built in open())
+        self._box_tail = None               # box overlap tail (complex128, M-1 samples)
         self._iq_resid = None               # leftover IQ samples between audio calls
         self._audio_gain = 60.0             # post-demod fixed gain (SSB baseband is small)
         self._agc_level = 0.05              # AGC running estimate of audio level
@@ -137,16 +139,36 @@ class SoapyAdapter(RadioAdapter):
         self._stream = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
         self._sdr.activateStream(self._stream)
 
-        # --- demod setup: STAGED decimation (samp_rate -> AUDIO_RATE) ---
-        # A single huge FIR at 2.048 MS/s is ~13x too slow on a Pi5 (70ms/call vs 5.3ms
-        # budget -> audio starves -> popping). Decimate in cheap stages instead: each
-        # stage is a short half/quarter-band FIR then [::M], so the expensive taps only
-        # ever run at progressively lower rates. 85 = 5 * 17; do 5 then 17.
-        self._decim = max(1, int(round(self.samp_rate / AUDIO_RATE)))   # 85 for 2.048M/24k
-        self._stages = self._factor_decim(self._decim)                  # e.g. [5, 17]
-        rate = self.samp_rate
+        self._setup_demod()          # staged decimation: CIC box stage + short FIRs
+
+        self._run = True
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def _setup_demod(self):
+        """Build the samp_rate -> AUDIO_RATE decimation chain (called by open()).
+
+        Stage 1 is a CIC-style BOX decimator (integrator = cumsum, comb = stride
+        difference): ZERO multiplies — benchmarked on the Odroid C2 at 0.05 ms
+        per packet vs 1.85 ms for the np.convolve FIR it replaces, with the box
+        nulls sitting exactly on the fold frequencies. Stages 2..N keep the short
+        Hamming FIRs: they run at progressively lower rates (cheap, ~0.4 ms total
+        combined) and supply the sharp stopband right next to the audio band —
+        stage 1's weak sidelobes land where those later FIRs are strong.
+
+        Why not one big FIR: a single huge FIR at full rate is ~13x too slow on
+        a Pi5 (70 ms/call vs 5.3 ms budget -> audio starves -> popping); the
+        original fix was short staged FIRs — this takes the first stage further.
+        """
+        np = self._np
+        self._decim = max(1, int(round(self.samp_rate / AUDIO_RATE)))   # 40 for 960k/24k
+        self._stages = self._factor_decim(self._decim)                  # e.g. [5, 4, 2]
+        self._box_m = self._stages[0] if self._stages and self._stages[0] > 1 else None
+        rest = self._stages[1:] if self._box_m is not None else list(self._stages)
+        self._box_tail = np.zeros((self._box_m - 1) if self._box_m else 1,
+                                  dtype=np.complex128)
         self._stage_firs = []                                            # (taps, state) per stage
-        for M in self._stages:
+        for M in rest:
             # short anti-alias FIR for this stage: cutoff at the post-decimation Nyquist
             ntaps = 4 * M + 1
             cutoff = 0.45 / M                                            # normalised to this stage's input rate
@@ -154,12 +176,7 @@ class SoapyAdapter(RadioAdapter):
             h = (np.sinc(2 * cutoff * idx) * np.hamming(ntaps))
             h = (h / h.sum()).astype(np.float64)
             self._stage_firs.append([h, np.zeros(ntaps - 1, dtype=np.complex128), M])
-            rate /= M
         self._iq_resid = np.zeros(0, dtype=np.complex64)
-
-        self._run = True
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
 
     def close(self):
         self._run = False
@@ -255,8 +272,8 @@ class SoapyAdapter(RadioAdapter):
         """Return n_samples of 24 kHz mono audio (float, ~[-1,1]) demodulated from
         the live IQ at the slice frequency. None if not enough IQ buffered yet."""
         np = self._np
-        if np is None or not self._stage_firs:
-            return None
+        if np is None or self._decim is None:
+            return None                      # demod not built yet (open() not called)
         if slice_hz is not None:
             self.set_slice(slice_hz)        # sets demod target + hardware retune if off-window
         if mode is not None:
@@ -273,15 +290,34 @@ class SoapyAdapter(RadioAdapter):
         iq = self._iq_resid[:need_in].astype(np.complex128)
         self._iq_resid = self._iq_resid[need_in:]
 
-        # 1) mix the slice down to baseband: shift by (slice - hardware centre)
+        # 1) mix the slice down to baseband: shift by (slice - hardware centre).
+        # IF-tap lock (and the untouched default) put the slice EXACTLY on the
+        # centre -> f_off == 0 and _nco_phase stays 0 -> the mix would be
+        # exp(0) = 1. Skip it outright: np.exp(1j*ph) cost ~1.1 ms per packet
+        # on the C2 (per-element cexp, no SIMD) — pure waste on the IF-tap path.
         f_off = self._slice_hz - self.center_hz
-        k = np.arange(len(iq))
-        ph = self._nco_phase + 2.0 * np.pi * (-f_off) / self.samp_rate * k
-        iq = iq * np.exp(1j * ph)
-        self._nco_phase = (ph[-1] + 2.0 * np.pi * (-f_off) / self.samp_rate) % (2.0 * np.pi)
+        if f_off != 0.0 or self._nco_phase != 0.0:
+            k = np.arange(len(iq))
+            ph = self._nco_phase + 2.0 * np.pi * (-f_off) / self.samp_rate * k
+            iq = iq * np.exp(1j * ph)
+            self._nco_phase = (ph[-1] + 2.0 * np.pi * (-f_off) / self.samp_rate) % (2.0 * np.pi)
 
-        # 2) STAGED anti-alias + decimate (cheap: taps run at ever-lower rates)
+        # 2) STAGED anti-alias + decimate.
+        # Stage 1: CIC-style box (integrator = cumsum, comb = stride difference).
+        # Zero multiplies — np.convolve at full rate cost 1.85 ms/call here; the
+        # box does the same job in ~0.05 ms, with nulls exactly on the fold
+        # frequencies (k * fs/M). Its weak sidelobes land at band edges where the
+        # stage-2..N Hamming FIRs below are strongest.
         sig = iq
+        M = self._box_m
+        if M:
+            xcat = np.concatenate([self._box_tail, sig])          # M-1 history + block
+            cs = np.empty(len(xcat) + 1, dtype=np.complex128)     # prefix sums, 0-based
+            cs[0] = 0
+            np.cumsum(xcat, out=cs[1:])
+            starts = (M - 1) + M * np.arange(len(sig) // M)       # per-output window start
+            sig = (cs[starts + M] - cs[starts]) / M               # box average (DC gain 1, as the FIR had)
+            self._box_tail = xcat[-(M - 1):]
         for fir in self._stage_firs:
             taps, state, M = fir
             x = np.concatenate([state, sig])

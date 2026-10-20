@@ -151,10 +151,141 @@ def test_panel_fragment():
     print("ok  panel: adapter audio sources rendered (checked = current)")
 
 
+def _demod_adapter(lock=True, center=47_055_000.0, samp=960_000.0):
+    """SoapyAdapter without hardware: demod chain built, no open()/USB."""
+    import numpy as np
+    from aether_gate.adapters.soapy import SoapyAdapter
+    a = SoapyAdapter(center_hz=center, samp_rate=samp,
+                     lock_hz=(center if lock else None), model="TEST")
+    a._np = np
+    a._setup_demod()
+    return a
+
+
+def _tone_blocks(n_blocks, block, f0=1875.0, amp=0.003, sr=960_000.0):
+    """Continuous-phase complex64 tone at f0 — 1875 Hz lands on bin 10 of a
+    128-sample FFT at 24 kHz, making peak checks exact."""
+    import numpy as np
+    out, n = [], 0
+    for _ in range(n_blocks):
+        k = np.arange(n, n + block)
+        out.append((amp * np.exp(2j * np.pi * f0 * k / sr)).astype(np.complex64))
+        n += block
+    return out
+
+
+def test_demod_fast_path():
+    import numpy as np
+    a = _demod_adapter()                       # lock mode (IF tap): f_off == 0
+    need = 128 * a._decim
+    assert a._box_m == 5 and [f[2] for f in a._stage_firs] == [4, 2], \
+        (a._box_m, [f[2] for f in a._stage_firs])      # 960k -> box(5) + FIR 4, 2
+
+    # --- DC exactness: constant input -> constant output at gain 1 ----------
+    dc = 0.003
+    blk = np.full(need, dc, dtype=np.complex64)
+    for _ in range(2):                          # warmup states
+        a._audio_q.append(blk.copy())
+        assert len(a.get_audio(128)) == 128
+    a._agc_level = a._agc_target = dc * a._audio_gain   # neutral AGC: scale == 1
+    a._audio_q.append(blk.copy())
+    out = np.array(a.get_audio(128))
+    assert out.shape == (128,) and np.all(np.isfinite(out))
+    assert np.max(np.abs(out - dc * a._audio_gain)) < 0.02, \
+        f"box/FIR DC gain off: mean={out.mean():.4f} want={dc * a._audio_gain:.4f}"
+
+    # --- NCO skip proof: np.exp must NOT be called in lock mode ------------
+    tblock = _tone_blocks(1, need)[0]           # generate BEFORE patching np.exp
+    boom = []
+    orig = np.exp
+    def counting_exp(x, *args, **kwargs):
+        boom.append(1)
+        return orig(x, *args, **kwargs)
+    np.exp = counting_exp
+    try:
+        a._audio_q.append(tblock)
+        got = a.get_audio(128)
+    finally:
+        np.exp = orig
+    assert got is not None and not boom, \
+        "NCO ran in lock mode (f_off==0) — exp() must be skipped"
+
+    # --- non-lock mode still uses the NCO ---------------------------------
+    b = _demod_adapter(lock=False, center=14_100_000.0)
+    b.set_slice(14_101_000.0)                   # slice off centre -> mix required
+    nblock = _tone_blocks(1, 128 * b._decim)[0]  # BEFORE patching
+    calls = []
+    orig2 = np.exp
+    def counting_exp2(x, *args, **kwargs):
+        calls.append(1)
+        return orig2(x, *args, **kwargs)
+    np.exp = counting_exp2
+    try:
+        b._audio_q.append(nblock)
+        got2 = b.get_audio(128)
+    finally:
+        np.exp = orig2
+    assert got2 is not None and len(calls) >= 1, "non-lock path must run the NCO"
+    print("ok  demod: box DC gain, NCO skipped in lock mode, NCO runs when off-centre")
+
+
+def test_demod_vs_legacy_chain():
+    """The optimized chain (box stage + NCO skip) must demodulate the same
+    tone to the same FFT peak as the ORIGINAL all-FIR + cexp chain — catches
+    wrong decimation factors, misalignment, polarity/sideband flips."""
+    import numpy as np
+    a = _demod_adapter()                        # fresh states
+    need = 128 * a._decim
+    blocks = _tone_blocks(5, need)              # 5 calls: warmup + 4 measured
+
+    # --- legacy reference: original stage chain (FIRs for ALL factors + cexp)
+    decim = int(round(a.samp_rate / 24000.0))
+    firs = []
+    for M in a._factor_decim(decim):
+        ntaps = 4 * M + 1
+        cutoff = 0.45 / M
+        idx = np.arange(ntaps) - (ntaps - 1) / 2.0
+        h = np.sinc(2 * cutoff * idx) * np.hamming(ntaps)
+        firs.append([h / h.sum(), np.zeros(ntaps - 1, dtype=np.complex128), M])
+
+    def legacy_once(iq_in):
+        sig = iq_in.astype(np.complex128)
+        k = np.arange(len(sig))                 # f_off == 0 -> exp(0) == 1
+        sig = sig * np.exp(1j * (0.0 * k))
+        for fir in firs:
+            taps, state, M = fir
+            x = np.concatenate([state, sig])
+            y = np.convolve(x, taps, mode="valid")
+            fir[1] = sig[-(len(taps) - 1):]
+            sig = y[::M]
+        return np.real(sig[:128]) * a._audio_gain
+
+    new_outs, old_outs = [], []
+    for i, blk in enumerate(blocks):
+        a._audio_q.append(blk)
+        o = a.get_audio(128)
+        assert o is not None and len(o) == 128 and np.all(np.isfinite(o))
+        new_outs.append(np.array(o))
+        old_outs.append(legacy_once(blk))
+        if i == 1:                              # after warmup: neutralize AGC so the
+            # measured output == raw gain, directly comparable to legacy (no AGC)
+            a._agc_level = a._agc_target = 0.003 * a._audio_gain / np.sqrt(2.0)
+
+    new, old = np.concatenate(new_outs[3:]), np.concatenate(old_outs[3:])
+    X, Y = np.abs(np.fft.rfft(new)), np.abs(np.fft.rfft(old))
+    kx, ky = int(np.argmax(X[2:]) + 2), int(np.argmax(Y[2:]) + 2)
+    want = int(round(1875.0 * len(new) / 24000.0))   # 1875 Hz in rfft bins of len(new) @24k
+    assert kx == ky == want, f"peak bin mismatch: new={kx} old={ky} (want {want})"
+    ratio = X[kx] / max(Y[ky], 1e-9)
+    assert 0.6 <= ratio <= 1.7, f"tone amplitude off vs legacy: ratio={ratio:.2f}"
+    print("ok  demod: optimized chain matches legacy FFT peak + amplitude")
+
+
 def main():
     for t in (test_wf_vitafrequency_encoding, test_ptt_via_worker,
               test_audio_source_routing, test_radio_capture_released_on_switch,
-              test_panel_fragment):
+              test_panel_fragment, test_demod_fast_path,
+              test_demod_vs_legacy_chain):
         try:
             t()
         except AssertionError as e:
